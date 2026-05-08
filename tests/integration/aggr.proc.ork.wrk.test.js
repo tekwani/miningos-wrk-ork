@@ -247,7 +247,7 @@ async function createWorker (conf = {}, ctx = {}) {
   const mockInterval = new MockInterval()
 
   // Replace TetherWrkBase temporarily to prevent actual initialization
-  const basePath = require.resolve('tether-wrk-base/workers/base.wrk.tether')
+  const basePath = require.resolve('@tetherto/tether-wrk-base/workers/base.wrk.tether')
   const cached = require.cache[basePath]
 
   require.cache[basePath] = {
