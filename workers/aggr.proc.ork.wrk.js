@@ -1005,6 +1005,11 @@ class WrkProcAggr extends TetherWrkBase {
     return aggr
   }
 
+  async setWrkExtData (req) {
+    if (!req.type) throw new Error('ERR_TYPE_INVALID')
+    return await this.dataProxy.requestData('setWrkExtData', req, { timeout: 10000, type: req.type })
+  }
+
   async crossAggrActions () {
     if (!this.conf.globalConfig?.isAutoSleepAllowed) return
     const conf = this.conf.crossAggrAction
