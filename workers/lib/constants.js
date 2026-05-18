@@ -80,6 +80,7 @@ const RPC_METHODS = [
   { name: 'getActionsBatch', op: 'r' },
   { name: 'cancelActionsBatch', op: 'w' },
   { name: 'getWrkExtData', op: 'r' },
+  { name: 'setWrkExtData', op: 'w' },
   { name: 'tailLogCustomRangeAggr', op: 'r' },
   { name: 'getWrkConf', op: 'r' },
   { name: 'getThingConf', op: 'r' },
