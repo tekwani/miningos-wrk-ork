@@ -148,8 +148,9 @@ class WrkProcAggr extends TetherWrkBase {
 
     if (!req.keys) {
       return res.map(entry => {
-        delete entry.info.rpcPublicKey
-        return entry
+        const sanitized = cloneDeep(entry)
+        delete sanitized.info.rpcPublicKey
+        return sanitized
       })
     }
 
@@ -662,7 +663,8 @@ class WrkProcAggr extends TetherWrkBase {
   async _shouldSkipRackType (type, rack) {
     if (!type) return false
     const rackEntry = await this.racks.get(rack)
-    const rackData = rackEntry ? JSON.parse(rackEntry.toString()) : null
+    const raw = rackEntry?.value ?? rackEntry
+    const rackData = raw ? JSON.parse(raw.toString()) : null
     return (rackData && rackData.type !== type && !rackData.type.startsWith(`${type}-`))
   }
 

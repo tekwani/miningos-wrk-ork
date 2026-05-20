@@ -33,7 +33,7 @@
     "test": "npm run lint && npm run test:unit && npm run test:integration",
     "test:unit": "NODE_ENV=test brittle tests/unit/*.js",
     "test:integration": "NODE_ENV=test brittle tests/integration/*.js",
-    "test:coverage": "brittle --coverage tests/**/*.js",
+    "test:coverage": "brittle --coverage tests/unit/*.js tests/integration/*.js",
     "dev": "node worker.js --wtype wrk-ork-proc-aggr --env development --cluster shard-1"
   },
   "dependencies": {

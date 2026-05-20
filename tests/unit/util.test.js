@@ -1,7 +1,7 @@
 'use strict'
 
 const test = require('brittle')
-const { daysTo24HrIntervals, isCurrentDay, getNestedProperty } = require('../../workers/lib/util')
+const { daysTo24HrIntervals, isCurrentDay, getNestedProperty, getValue, sortThings } = require('../../workers/lib/util')
 
 test('daysTo24HrIntervals', async (t) => {
   t.test('should generate intervals for 1 day', async (t) => {
@@ -115,5 +115,68 @@ test('getNestedProperty', async (t) => {
       ]
     }
     t.is(getNestedProperty(obj, ['items', '0', 'name']), 'first', 'should handle array indices')
+  })
+})
+
+test('getValue', async (t) => {
+  t.test('should get nested value by dot path', async (t) => {
+    const obj = { stats: { hashrate: 100 } }
+    t.is(getValue(obj, 'stats.hashrate'), 100, 'should return nested value')
+  })
+
+  t.test('should return undefined for missing path', async (t) => {
+    t.is(getValue({ a: 1 }, 'b.c'), undefined, 'should return undefined')
+    t.is(getValue(null, 'a'), null, 'should return null when root object is null')
+  })
+})
+
+test('sortThings', async (t) => {
+  t.test('should return 1 when sortBy is empty', async (t) => {
+    t.is(sortThings({ id: 'a' }, { id: 'b' }, {}), 1, 'should maintain order when sortBy empty')
+    t.is(sortThings({ id: 'a' }, { id: 'b' }, null), 1, 'should maintain order when sortBy null')
+  })
+
+  t.test('should sort numerically ascending', async (t) => {
+    const things = [
+      { meta: { rank: '10' } },
+      { meta: { rank: '2' } },
+      { meta: { rank: '1' } }
+    ]
+    things.sort((a, b) => sortThings(a, b, { 'meta.rank': 1 }))
+    t.is(things[0].meta.rank, '1', 'should sort 1 first')
+    t.is(things[1].meta.rank, '2', 'should sort 2 second')
+    t.is(things[2].meta.rank, '10', 'should sort 10 last')
+  })
+
+  t.test('should sort descending with negative order', async (t) => {
+    const things = [
+      { name: 'alpha' },
+      { name: 'beta' }
+    ]
+    things.sort((a, b) => sortThings(a, b, { name: -1 }))
+    t.is(things[0].name, 'beta', 'should sort beta first when descending')
+    t.is(things[1].name, 'alpha', 'should sort alpha second when descending')
+  })
+
+  t.test('should sort by token count when shared prefix matches', async (t) => {
+    t.is(
+      sortThings({ label: 'abc-def' }, { label: 'abc' }, { label: 1 }),
+      1,
+      'more tokens should sort after shorter match'
+    )
+    t.is(sortThings({ label: 'same' }, { label: 'same' }, { label: 1 }), 0, 'equal labels should be stable')
+  })
+
+  t.test('should place undefined values last', async (t) => {
+    t.is(
+      sortThings({ meta: { rank: 1 } }, { meta: {} }, { 'meta.rank': 1 }),
+      -1,
+      'defined should sort before undefined'
+    )
+    t.is(
+      sortThings({ meta: {} }, { meta: { rank: 1 } }, { 'meta.rank': 1 }),
+      1,
+      'undefined should sort after defined'
+    )
   })
 })
