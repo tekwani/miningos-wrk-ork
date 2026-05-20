@@ -297,6 +297,8 @@ async function createWorker (conf = {}, ctx = {}) {
     }
 
     worker = new WrkProcAggr(mockConf, mockCtx)
+    worker.mem = { crossActionsLRU: {}, ...(worker.mem || {}) }
+    worker.savedAggrKeys = worker.savedAggrKeys || {}
 
     // Restore original methods
     WrkProcAggrProto.start = originalStart
@@ -515,6 +517,26 @@ test('listRacks', async (t) => {
     t.is(result[0].info.rpcPublicKey, 'secret-key', 'should expose rpcPublicKey')
   })
 
+  t.test('should not mutate stored rack info when redacting keys', async (t) => {
+    const worker = await createWorker()
+    worker._start(() => {})
+
+    await worker.registerRack({
+      id: 'rack-1',
+      type: 'wrk-miner-s19',
+      info: { rpcPublicKey: 'secret-key', region: 'us-east' }
+    })
+
+    const redacted = await worker.listRacks({})
+    t.is(redacted.length, 1, 'should return rack')
+    t.ok(!redacted[0].info.rpcPublicKey, 'redacted response should hide rpcPublicKey')
+    t.is(redacted[0].info.region, 'us-east', 'redacted response should keep other info fields')
+
+    const withKeys = await worker.listRacks({ keys: true })
+    t.is(withKeys[0].info.rpcPublicKey, 'secret-key', 'stored rack should still expose rpcPublicKey')
+    t.is(withKeys[0].info.region, 'us-east', 'stored rack should keep other info fields')
+  })
+
   t.test('should throw error for invalid type', async (t) => {
     const worker = await createWorker()
     worker._start(() => {})
@@ -609,6 +631,28 @@ test('listThings', async (t) => {
     t.ok(Array.isArray(result), 'should return array')
     t.is(result.length, 0, 'should return empty array on error')
   })
+
+  t.test('should sort things when sort is provided', async (t) => {
+    const worker = await createWorker()
+    worker._start(() => {})
+
+    worker.net_r0.jRequest = async () => {
+      return [
+        { id: 'thing-b', meta: { rank: '2' } },
+        { id: 'thing-a', meta: { rank: '1' } }
+      ]
+    }
+
+    await worker.registerRack({
+      id: 'rack-1',
+      type: 'wrk-miner-s19',
+      info: { rpcPublicKey: 'key1' }
+    })
+
+    const result = await worker.listThings({ sort: { 'meta.rank': 1 } })
+    t.is(result[0].id, 'thing-a', 'should sort by rank ascending')
+    t.is(result[1].id, 'thing-b', 'should sort second item')
+  })
 })
 
 test('getHistoricalLogs', async (t) => {
@@ -636,6 +680,32 @@ test('getHistoricalLogs', async (t) => {
     } catch (err) {
       t.is(err.message, 'ERR_LOG_TYPE_INVALID', 'should throw correct error')
     }
+  })
+
+  t.test('should sort historical logs when sort is provided', async (t) => {
+    const worker = await createWorker()
+    worker._start(() => {})
+
+    worker.net_r0.jRequest = async () => {
+      return [
+        { ts: 2, message: 'b' },
+        { ts: 1, message: 'a' }
+      ]
+    }
+
+    await worker.registerRack({
+      id: 'rack-1',
+      type: 'miner-s19',
+      info: { rpcPublicKey: 'key1' }
+    })
+
+    const result = await worker.getHistoricalLogs({
+      logType: 'test',
+      sort: { ts: 1 }
+    })
+
+    t.is(result[0].ts, 1, 'should sort ascending by ts')
+    t.is(result[1].ts, 2, 'should sort second entry')
   })
 })
 
@@ -712,6 +782,48 @@ test('pushAction', async (t) => {
 
     const result = await worker.pushAction(req)
     t.ok(result.errors.length > 0, 'should return errors')
+  })
+
+  t.test('should skip racks that do not match rackType', async (t) => {
+    const worker = await createWorker()
+    worker._start(() => {})
+
+    await worker.registerRack({
+      id: 'rack-miner',
+      type: 'wrk-miner-s19',
+      info: { rpcPublicKey: 'key-miner' }
+    })
+    await worker.registerRack({
+      id: 'rack-container',
+      type: 'wrk-container',
+      info: { rpcPublicKey: 'key-container' }
+    })
+
+    worker.actionCaller = {
+      getWriteCalls: async () => ({
+        targets: {
+          'rack-miner': { reqVotes: 1, calls: [{ id: 'm1' }] },
+          'rack-container': { reqVotes: 1, calls: [{ id: 'c1' }] }
+        },
+        requiredPerms: ['miner:rw']
+      })
+    }
+
+    const result = await worker.pushAction({
+      query: {},
+      action: 'reboot',
+      params: [],
+      voter: 'test@example.com',
+      authPerms: ['miner:rw'],
+      rackType: 'wrk-miner-s19'
+    })
+
+    t.ok(result.id, 'should push action for matching rack type')
+    const targets = result.data.data.payload[1]
+    t.ok(targets['rack-miner'], 'should include miner rack')
+    t.ok(!targets['rack-miner'].reqVotes, 'processed rack should have reqVotes stripped')
+    t.is(targets['rack-container'].reqVotes, 1, 'skipped rack should keep original reqVotes')
+    t.ok(targets['rack-container'].calls.length, 'skipped rack should keep calls')
   })
 })
 
@@ -884,6 +996,38 @@ test('queryActions', async (t) => {
       t.is(err.message, 'ERR_QUERIES_TYPE_INVALID', 'should throw correct error')
     }
   })
+
+  t.test('should filter invalid errors from done actions when groupBatch is true', async (t) => {
+    const worker = await createWorker()
+    worker._start(() => {})
+
+    worker.actionApprover_0.query = (type) => {
+      const actions = []
+      for (const [key, action] of worker.actionApprover_0.actions.entries()) {
+        if (key.startsWith(`${type}-`)) actions.push(action)
+      }
+      return actions
+    }
+
+    worker.actionApprover_0.actions.set('done-invalid', {
+      id: 'invalid',
+      action: 'reboot',
+      payload: [[], { 'rack-1': { calls: [], error: 'UNKNOWN_METHOD: reboot' } }, ['miner:rw']]
+    })
+    worker.actionApprover_0.actions.set('done-valid', {
+      id: 'valid',
+      action: 'reboot',
+      payload: [[], { 'rack-2': { calls: [{ id: 't1' }] } }, ['miner:rw']]
+    })
+
+    const result = await worker.queryActions({
+      queries: [{ type: 'done', filter: {} }],
+      groupBatch: true
+    })
+
+    t.is(result.done.length, 1, 'should filter done actions with only invalid errors')
+    t.is(result.done[0].id, 'valid', 'should keep valid done action')
+  })
 })
 
 test('getActionsBatch', async (t) => {
@@ -979,6 +1123,16 @@ test('setGlobalConfig', async (t) => {
     } catch (err) {
       t.is(err.message, 'ERR_GLOBAL_CONFIG_NOT_FOUND', 'should throw correct error')
     }
+  })
+
+  t.test('should return null when isAutoSleepAllowed is not provided', async (t) => {
+    const worker = await createWorker({
+      globalConfig: { isAutoSleepAllowed: false, other: 'value' }
+    })
+    worker._start(() => {})
+
+    const result = await worker.setGlobalConfig({ other: 'ignored' })
+    t.is(result, null, 'should return null when isAutoSleepAllowed not in request')
   })
 })
 
@@ -1192,7 +1346,46 @@ test('deleteThingComment', async (t) => {
   })
 })
 
+const minimalAggrStats = {
+  miner: {
+    ops: {
+      hashrate_mhs_1m_sum_aggr: { op: 'sum', src: 'hashrate_mhs_1m_sum' }
+    }
+  }
+}
+
 test('tailLog', async (t) => {
+  t.test('should aggregate tail log data when configured', async (t) => {
+    const worker = await createWorker({ aggrStats: minimalAggrStats })
+    worker._start(() => {})
+
+    const ts = Date.now()
+    worker.net_r0.jRequest = async (publicKey, method) => {
+      if (method === 'tailLog') {
+        return [{ ts, hashrate_mhs_1m_sum: 100, aggrCount: 1, aggrIntervals: 1 }]
+      }
+      return []
+    }
+
+    await worker.registerRack({
+      id: 'rack-1',
+      type: 'miner-s19',
+      info: { rpcPublicKey: 'key1' }
+    })
+
+    const result = await worker.tailLog({
+      type: 'miner',
+      key: 'stat-5m',
+      tag: 't-miner',
+      aggrFields: { hashrate_mhs_1m_sum_aggr: 1 },
+      fields: { hashrate_mhs_1m_sum: 1 }
+    })
+
+    t.ok(Array.isArray(result), 'should return aggregated array')
+    t.is(result.length, 1, 'should return one aggregated bucket')
+    t.ok(result[0].hashrate_mhs_1m_sum_aggr !== undefined, 'should include aggregated field')
+  })
+
   t.test('should throw error when not configured', async (t) => {
     const worker = await createWorker()
     worker._start(() => {})
@@ -1243,6 +1436,166 @@ test('tailLogMulti', async (t) => {
     } catch (err) {
       t.is(err.message, 'ERR_TYPE_INVALID', 'should throw correct error')
     }
+  })
+
+  t.test('should aggregate multiple tail log keys', async (t) => {
+    const worker = await createWorker({ aggrStats: minimalAggrStats })
+    worker._start(() => {})
+
+    const ts = Date.now()
+    worker.net_r0.jRequest = async (publicKey, method) => {
+      if (method === 'tailLog') {
+        return [{ ts, hashrate_mhs_1m_sum: 50, aggrCount: 1, aggrIntervals: 1 }]
+      }
+      return []
+    }
+
+    await worker.registerRack({
+      id: 'rack-1',
+      type: 'miner-s19',
+      info: { rpcPublicKey: 'key1' }
+    })
+
+    const result = await worker.tailLogMulti({
+      keys: [
+        { type: 'miner', key: 'stat-5m', tag: 't-miner', aggrFields: { hashrate_mhs_1m_sum_aggr: 1 }, fields: { hashrate_mhs_1m_sum: 1 } },
+        { type: 'miner', key: 'stat-1h', tag: 't-miner', aggrFields: { hashrate_mhs_1m_sum_aggr: 1 }, fields: { hashrate_mhs_1m_sum: 1 } }
+      ]
+    })
+
+    t.is(result.length, 2, 'should return result per key')
+    t.ok(Array.isArray(result[0]), 'each entry should be aggregated array')
+  })
+})
+
+test('aggregateTailLogs', async (t) => {
+  t.test('should store aggregated tail logs in db', async (t) => {
+    const worker = await createWorker()
+    worker._start(() => {})
+
+    worker.conf.aggrStats = minimalAggrStats
+    worker.conf.aggrData = {
+      aggrTailLogStoreDays: 1,
+      aggrTailLogApiDelay: 0,
+      aggrTailLogKeys: [{
+        key: 'stat-5m',
+        type: 'miner',
+        tag: 't-miner',
+        limit: 1,
+        fields: { hashrate_mhs_1m_sum: 1 },
+        aggrFields: { hashrate_mhs_1m_sum_aggr: 1 }
+      }]
+    }
+    worker.conf.globalConfig = {
+      aggrTailLogTimezones: [{ code: 'UTC', offset: 0 }]
+    }
+    worker.aggregatingTailLogs = false
+
+    const ts = Date.now()
+    worker.net_r0.jRequest = async (publicKey, method) => {
+      if (method === 'tailLog') {
+        return [{ ts, hashrate_mhs_1m_sum: 10, aggrCount: 1, aggrIntervals: 1 }]
+      }
+      return []
+    }
+
+    await worker.registerRack({
+      id: 'rack-1',
+      type: 'miner-s19',
+      info: { rpcPublicKey: 'key1' }
+    })
+
+    let tailLogCalls = 0
+    const originalTailLog = worker.tailLog.bind(worker)
+    worker.tailLog = async (req) => {
+      tailLogCalls++
+      return originalTailLog(req)
+    }
+
+    await worker.aggregateTailLogs()
+
+    t.ok(tailLogCalls > 0, 'should fetch tail logs for configured keys')
+    t.ok(worker.lastFetchedAggrLogs, 'should record last fetch timestamp')
+
+    const storedKeys = worker.tailLogAggrDb.createReadStream().map(entry => entry.key)
+    t.ok(storedKeys.some(key => key.startsWith('tail-log-miner-')), 'should persist aggregated tail log')
+  })
+})
+
+test('crossAggrActions', async (t) => {
+  t.test('should push cross aggregation actions for matching things', async (t) => {
+    const worker = await createWorker({
+      globalConfig: { isAutoSleepAllowed: true },
+      crossAggrAction: {
+        tagPrefix: 'site-',
+        crossThingType: 'container',
+        action: 'sleep',
+        params: [],
+        authPerms: ['container:w'],
+        listThingsReq: {},
+        crossThingsActionReq: {
+          devicesCondition: [],
+          fields: { id: 1 }
+        },
+        minActionTsDiff: 0
+      }
+    })
+    worker._start(() => {})
+
+    await worker.registerRack({
+      id: 'rack-1',
+      type: 'container',
+      info: { rpcPublicKey: 'key1' }
+    })
+
+    let listThingsCalls = 0
+    worker.net_r0.jRequest = async (publicKey, method) => {
+      if (method === 'listThings') {
+        listThingsCalls++
+        if (listThingsCalls === 1) {
+          return [{ tags: ['site-alpha', 't-container'] }]
+        }
+        return [{ id: 'device-1', tags: ['t-container', 'site-alpha'] }]
+      }
+      return null
+    }
+
+    const pushed = []
+    worker.pushAction = async (req) => {
+      pushed.push(req)
+      return { id: 'action-1', errors: [] }
+    }
+
+    await worker.crossAggrActions()
+
+    t.is(pushed.length, 1, 'should push one cross aggregation action')
+    t.is(pushed[0].action, 'sleep', 'should use configured action')
+    t.ok(worker.mem.crossActionsLRU['container_site-alpha'], 'should record action timestamp in LRU')
+  })
+
+  t.test('should return early when auto sleep is disabled', async (t) => {
+    const worker = await createWorker({
+      globalConfig: { isAutoSleepAllowed: false },
+      crossAggrAction: {
+        tagPrefix: 'site-',
+        crossThingType: 'container',
+        action: 'sleep',
+        params: [],
+        authPerms: ['container:w'],
+        listThingsReq: {},
+        crossThingsActionReq: { devicesCondition: [], fields: { id: 1 } }
+      }
+    })
+    worker._start(() => {})
+
+    let listThingsCalled = false
+    worker.net_r0.jRequest = async () => {
+      listThingsCalled = true
+      return []
+    }
+
+    await worker.crossAggrActions()
+    t.ok(!listThingsCalled, 'should not list things when auto sleep disabled')
   })
 })
 
@@ -1303,6 +1656,50 @@ test('getWrkExtData', async (t) => {
     } catch (err) {
       t.is(err.message, 'ERR_TYPE_INVALID', 'should throw correct error')
     }
+  })
+
+  t.test('should aggregate ext data and apply cross thing aggregation', async (t) => {
+    const worker = await createWorker({
+      aggrStats: minimalAggrStats,
+      aggrCrossthg: {
+        miner: {
+          searchAggr: [
+            { $unwind: '$crossThings' },
+            { $group: { _id: null, ids: { $addToSet: '$crossThings.id' } } },
+            { $project: { ids: 1 } }
+          ],
+          searchFields: ['id', 'value'],
+          crossArrKey: 'crossThings',
+          crossObjKey: 'id',
+          thgProperty: ['value'],
+          groupAggr: [{ $group: { _id: null, total: { $sum: '$crossThg' } } }]
+        }
+      }
+    })
+    worker._start(() => {})
+
+    const ts = Date.now()
+    worker.listThings = async () => [{ id: 'thing1', value: 5 }]
+    worker.net_r0.jRequest = async () => [{
+      ts,
+      hashrate_mhs_1m_sum: 10,
+      crossThings: [{ id: 'thing1', crossObjKey: 'id' }]
+    }]
+
+    await worker.registerRack({
+      id: 'rack-1',
+      type: 'miner-s19',
+      info: { rpcPublicKey: 'key1' }
+    })
+
+    const result = await worker.getWrkExtData({
+      type: 'miner',
+      applyAggrCrossthg: true
+    })
+
+    t.ok(Array.isArray(result), 'should return aggregated array')
+    t.is(result.length, 1, 'should return one aggregated group')
+    t.ok(result[0].hashrate_mhs_1m_sum_aggr !== undefined, 'should include aggregated stats')
   })
 })
 

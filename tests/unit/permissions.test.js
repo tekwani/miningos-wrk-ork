@@ -38,6 +38,12 @@ test('hasPermission', async (t) => {
     ], 'miner:w'), 'should not allow permission')
   })
 
+  t.test('should return false for falsy requested permission', async (t) => {
+    t.ok(!hasPermission(['miner:rw'], null), 'should not allow null permission')
+    t.ok(!hasPermission(['miner:rw'], undefined), 'should not allow undefined permission')
+    t.ok(!hasPermission(['miner:rw'], ''), 'should not allow empty permission')
+  })
+
   t.test('read-write', async (t) => {
     t.ok(hasPermission([
       'miner:rw',
