@@ -2320,3 +2320,102 @@ test('updateConfig — pool validation on merge', async (t) => {
     }
   })
 })
+
+test('listFirmwares', async (t) => {
+  t.test('should return an empty array when no racks are registered', async (t) => {
+    const worker = await createWorker()
+    worker._start(() => {})
+
+    const result = await worker.listFirmwares({})
+    t.ok(Array.isArray(result), 'should return array')
+    t.is(result.length, 0, 'should return empty array with no racks')
+  })
+
+  t.test('should return firmwares from a registered rack', async (t) => {
+    const worker = await createWorker()
+    worker._start(() => {})
+
+    worker.net_r0.jRequest = async (publicKey, method, params, opts) => {
+      if (method === 'listFirmwares') {
+        return [{ id: 'fw-1', name: 'firmware-v1.0' }, { id: 'fw-2', name: 'firmware-v2.0' }]
+      }
+      return null
+    }
+
+    await worker.registerRack({
+      id: 'rack-1',
+      type: 'wrk-miner-s19',
+      info: { rpcPublicKey: 'key1' }
+    })
+
+    const result = await worker.listFirmwares({})
+    t.ok(Array.isArray(result), 'should return array')
+    t.is(result.length, 2, 'should return firmwares from rack')
+    t.is(result[0].id, 'fw-1')
+    t.is(result[1].id, 'fw-2')
+  })
+
+  t.test('should aggregate firmwares from multiple racks', async (t) => {
+    const worker = await createWorker()
+    worker._start(() => {})
+
+    worker.net_r0.jRequest = async (publicKey, method, params, opts) => {
+      if (method === 'listFirmwares') {
+        if (publicKey === 'key1') return [{ id: 'fw-1' }]
+        if (publicKey === 'key2') return [{ id: 'fw-2' }, { id: 'fw-3' }]
+      }
+      return []
+    }
+
+    await worker.registerRack({ id: 'rack-1', type: 'wrk-miner-s19', info: { rpcPublicKey: 'key1' } })
+    await worker.registerRack({ id: 'rack-2', type: 'wrk-miner-s19', info: { rpcPublicKey: 'key2' } })
+
+    const result = await worker.listFirmwares({})
+    t.ok(Array.isArray(result), 'should return array')
+    t.is(result.length, 3, 'should aggregate firmwares from all racks')
+  })
+
+  t.test('should handle errors from racks gracefully', async (t) => {
+    const worker = await createWorker()
+    worker._start(() => {})
+
+    worker.net_r0.jRequest = async () => {
+      throw new Error('Network error')
+    }
+
+    await worker.registerRack({
+      id: 'rack-1',
+      type: 'wrk-miner-s19',
+      info: { rpcPublicKey: 'key1' }
+    })
+
+    const result = await worker.listFirmwares({})
+    t.ok(Array.isArray(result), 'should return array')
+    t.is(result.length, 0, 'should return empty array on rack error')
+  })
+
+  t.test('should forward the request to racks and use correct timeout', async (t) => {
+    const worker = await createWorker()
+    worker._start(() => {})
+
+    const capturedCalls = []
+    worker.net_r0.jRequest = async (publicKey, method, params, opts) => {
+      capturedCalls.push({ publicKey, method, params, opts })
+      return []
+    }
+
+    await worker.registerRack({
+      id: 'rack-1',
+      type: 'wrk-miner-s19',
+      info: { rpcPublicKey: 'key1' }
+    })
+
+    const req = { filter: { type: 'miner' } }
+    await worker.listFirmwares(req)
+
+    t.is(capturedCalls.length, 1, 'should make one RPC call')
+    t.is(capturedCalls[0].method, 'listFirmwares', 'should call listFirmwares on rack')
+    t.alike(capturedCalls[0].params, req, 'should forward the request')
+    t.is(capturedCalls[0].opts.timeout, 10000, 'should use 10000ms timeout')
+  })
+})

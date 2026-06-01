@@ -245,6 +245,10 @@ class WrkProcAggr extends TetherWrkBase {
     return this.dataProxy.requestRackData(req.rackId, 'removeFile', req, { timeout: 30000 })
   }
 
+  async listFirmwares (req) {
+    return await this.dataProxy.requestData('listFirmwares', req, { timeout: 10000 })
+  }
+
   async aggregateTailLogs () {
     if (this.aggregatingTailLogs) return
     this.aggregatingTailLogs = true
