@@ -389,6 +389,10 @@
         "op": "arr_concat",
         "src": "stats"
       },
+      "datum": {
+        "op": "obj_concat",
+        "src": "datum"
+      },
       "workers": {
         "op": "arr_concat",
         "src": "workers"
