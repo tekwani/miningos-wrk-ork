@@ -390,7 +390,7 @@
         "src": "stats"
       },
       "datum": {
-        "op": "obj_concat",
+        "op": "arr_concat",
         "src": "datum"
       },
       "workers": {
