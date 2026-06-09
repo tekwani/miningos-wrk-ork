@@ -12,8 +12,21 @@ class ActionCaller {
   /**
    * @param {NetFacility} net
    * @param {Hyperbee} racks
+   * @param {number} callTargetsLimit
+   * @param {Object} orkInstance - Reference to the ORK worker instance for ORK-level actions
+   * @param {Object} orkActionsConfig - Configuration for ORK-level actions (whitelist, reqVotes, etc.)
+   * @param {Hyperbee} configsDb - Database for storing configs (pool configs, etc.)
+   * @param {Object} actionConfigResolvers - Configuration for resolving action params from configs
+   * @example actionConfigResolvers format:
+   * {
+   *   setupPools: {
+   *     configIdParam: 'poolConfigId',  // Param field containing config ID
+   *     configType: 'pool'              // Config type prefix in DB (e.g., 'pool:id')
+   *   }
+   * }
+   * The full config object is passed to the action. The device worker handles the transformation.
    */
-  constructor (net, racks, callTargetsLimit = 50) {
+  constructor (net, racks, callTargetsLimit = 50, orkInstance = null, orkActionsConfig = {}, configsDb = null, actionConfigResolvers = {}) {
     if (!(net instanceof NetFacility)) {
       throw new Error('ERR_NET_INVALID_INSTANCE')
     }
@@ -24,8 +37,93 @@ class ActionCaller {
 
     this._net = net
     this._racks = racks
+    this._orkInstance = orkInstance
+    this._orkActionsConfig = orkActionsConfig
+    this._configsDb = configsDb
+    this._actionConfigResolvers = actionConfigResolvers
     this.rackActions = new Set([ACTION_TYPES.REGISTER_THING, ACTION_TYPES.UPDATE_THING, ACTION_TYPES.FORGET_THINGS, ACTION_TYPES.RACK_REBOOT])
+    this.orkActions = new Set([ACTION_TYPES.REGISTER_CONFIG, ACTION_TYPES.UPDATE_CONFIG, ACTION_TYPES.DELETE_CONFIG])
     this._callTargetsLimit = callTargetsLimit
+  }
+
+  /**
+   * Check if an ORK action is whitelisted and enabled
+   * @param {string} action
+   * @returns {boolean}
+   */
+  isOrkActionAllowed (action) {
+    const config = this._orkActionsConfig[action]
+    return config && config.enabled === true
+  }
+
+  /**
+   * Get the required votes for an ORK action
+   * @param {string} action
+   * @returns {number}
+   */
+  getOrkActionReqVotes (action) {
+    const config = this._orkActionsConfig[action]
+    return config?.reqVotes || 1
+  }
+
+  /**
+   * Get the required permissions for an ORK action (to submit)
+   * @param {string} action
+   * @returns {string[]}
+   */
+  getOrkActionRequiredPerms (action) {
+    const config = this._orkActionsConfig[action]
+    return config?.requiredPerms || []
+  }
+
+  /**
+   * Get the required permissions to approve an ORK action
+   * @param {string} action
+   * @returns {string[]}
+   */
+  getOrkActionApprovalPerms (action) {
+    const config = this._orkActionsConfig[action]
+    // If no approvalPerms specified, use requiredPerms as fallback
+    return config?.approvalPerms || config?.requiredPerms || []
+  }
+
+  /**
+   * Resolves action params from a stored config based on actionConfigResolvers configuration
+   * Fetches the full config and passes it to the action. The device worker handles transformation.
+   * @param {string} action - The action name
+   * @param {Object} params - The action params (first element of params array)
+   * @returns {Promise<Array|null>} - Config data as params array or null if no resolution needed
+   */
+  async _resolveActionConfig (action, params) {
+    const resolver = this._actionConfigResolvers[action]
+    if (!resolver) {
+      return null
+    }
+
+    const { configIdParam, configType } = resolver
+
+    const configId = params?.[configIdParam]
+    if (!configId) {
+      return null
+    }
+
+    if (!this._configsDb) {
+      throw new Error('ERR_CONFIGS_DB_NOT_AVAILABLE')
+    }
+
+    const dbKey = `${configType}:${configId}`
+    const configData = await this._configsDb.get(dbKey)
+
+    if (!configData) {
+      throw new Error('ERR_CONFIG_NOT_FOUND')
+    }
+
+    const config = JSON.parse(configData.value.toString())
+    if (config?.status !== 'approved') {
+      throw new Error('ERR_CONFIG_NOT_APPROVED')
+    }
+
+    return [{ config }]
   }
 
   /**
@@ -66,10 +164,16 @@ class ActionCaller {
       )
     }
 
+    let resolvedParams = params
+    const resolved = await this._resolveActionConfig(method, params[0])
+    if (resolved) {
+      resolvedParams = resolved
+    }
+
     return this._net.jRequest(
       entry.info.rpcPublicKey,
       'queryThing',
-      { id, method, params }
+      { id, method, params: resolvedParams }
     )
   }
 
@@ -84,7 +188,8 @@ class ActionCaller {
     *    string, {
     *      reqVotes: number,
     *      calls: Array<{id: string, tags: string[]}>,
-    *      error?: string
+    *      error?: string,
+    *      isOrkAction?: boolean
     *    }>
    *  }>}
    */
@@ -104,6 +209,34 @@ class ActionCaller {
     }
     if (!Array.isArray(params)) {
       throw new Error('ERR_PARAMS_INVALID')
+    }
+
+    if (this.orkActions.has(action)) {
+      if (!this.isOrkActionAllowed(action)) {
+        throw new Error('ERR_ORK_ACTION_NOT_ALLOWED')
+      }
+
+      const requiredPerms = this.getOrkActionRequiredPerms(action)
+      for (const perm of requiredPerms) {
+        if (!hasWritePermission(permissions, perm)) {
+          throw new Error('ERR_PERMISSION_DENIED')
+        }
+      }
+
+      const approvalPerms = this.getOrkActionApprovalPerms(action)
+
+      return {
+        targets: {
+          ork: {
+            reqVotes: this.getOrkActionReqVotes(action),
+            calls: [{ id: 'ork', tags: [] }],
+            isOrkAction: true,
+            approvalPerms
+          }
+        },
+        requiredPerms,
+        approvalPerms
+      }
     }
 
     const targets = {}
@@ -174,9 +307,28 @@ class ActionCaller {
   /**
    * @param {string} action
    * @param {any[]} params
-   * @param {Object<string, { calls: Array<{id: string, tags: string[]}>, error?: string }>} targets
+   * @param {Object<string, { calls: Array<{id: string, tags: string[]}>, error?: string, isOrkAction?: boolean }>} targets
    */
   async callTargets (action, params, targets) {
+    if (this.orkActions.has(action) && targets.ork?.isOrkAction) {
+      if (!this._orkInstance) {
+        throw new Error('ERR_ORK_INSTANCE_NOT_SET')
+      }
+
+      const orkMethod = this._orkInstance[action]
+      if (typeof orkMethod !== 'function') {
+        throw new Error('ERR_ORK_METHOD_NOT_FOUND')
+      }
+
+      try {
+        const result = await orkMethod.call(this._orkInstance, params[0])
+        targets.ork.calls[0].result = result
+      } catch (err) {
+        targets.ork.calls[0].error = err.message
+      }
+      return
+    }
+
     const calls = Object.entries(targets).map(
       ([rack, entry]) => entry.calls.map(call => [rack, call])
     ).flat(1)

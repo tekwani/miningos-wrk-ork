@@ -14,10 +14,24 @@ const {
   RPC_METHODS,
   COMMENT_ACTION,
   INVALID_ACTIONS_ERRORS,
-  DEFAULT_TIMEZONE
+  DEFAULT_TIMEZONE,
+  DISALLOWED_QUERY_OPERATORS,
+  CONFIG_TYPES,
+  DEFAULT_ACTION_CONFIG_RESOLVERS
 } = require('./lib/constants')
 const aggrCrossthg = require('./lib/aggr.crossthg')
 const { setTimeout: sleep } = require('timers/promises')
+const { createDataProxy } = require('./lib/data.proxy')
+
+const MAX_QUERIES_COUNT = 50
+const MAX_SUFFIX_LENGTH = 200
+const MAX_REGEX_LENGTH = 200
+const ALLOWED_QUERY_OPERATORS = new Set([
+  '$gt', '$gte', '$lt', '$lte', '$eq', '$ne',
+  '$in', '$nin', '$regex', '$options', '$exists',
+  '$elemMatch', '$not', '$type', '$size',
+  '$and', '$or', '$nor'
+])
 
 class WrkProcAggr extends TetherWrkBase {
   constructor (conf, ctx) {
@@ -32,8 +46,24 @@ class WrkProcAggr extends TetherWrkBase {
     this.loadConf('base.ork', 'ork')
     this._loadOptionalConfigs()
 
-    this.init()
-    this.start()
+    this.crossActionsLRU = {}
+    this.savedAggrKeys = {}
+    this._racksCache = null
+
+    ctx.isRpcMode = ctx.isRpcMode !== false
+    ctx.libMap = new Map()
+    const self = this
+    this.dataProxy = createDataProxy({
+      isRpcMode: ctx.isRpcMode,
+      getRacksEntries () { return self._getRacksEntries() },
+      get net_r0 () { return self.net_r0 },
+      get libMap () { return ctx.libMap }
+    })
+
+    if (ctx.isRpcMode) {
+      this.init()
+      this.start()
+    }
   }
 
   _loadOptionalConfigs () {
@@ -51,21 +81,17 @@ class WrkProcAggr extends TetherWrkBase {
 
     this.setInitFacs([
       ['fac', '@bitfinex/bfx-facs-interval', '0', '0', {}, -10],
-      ['fac', '@bitfinex/bfx-facs-scheduler', '0', '0', {}, -10],
       ['fac', '@tetherto/hp-svc-facs-store', 's1', 's1', {
         storeDir: `store/${this.ctx.cluster}-db`
       }, -5],
-      ['fac', '@bitfinex/bfx-facs-lru', 'r0', 'r0', {
-        maxAge: 900000,
-        max: 100000
-      }, 0],
       ['fac', '@tetherto/svc-facs-action-approver', '0', '0', {}, 20]
     ])
+  }
 
-    this.mem = {
-      crossActionsLRU: {}
-    }
-    this.savedAggrKeys = {}
+  setFacs (facs) {
+    this.interval_0 = facs.interval_0
+    this.store_s1 = facs.store_s1
+    this.actionApprover_0 = facs.actionApprover_0
   }
 
   debugGeneric (msg) {
@@ -79,6 +105,16 @@ class WrkProcAggr extends TetherWrkBase {
     debug(`[STORE/${this.ctx.cluster}]`, data, e)
   }
 
+  async _getRacksEntries () {
+    if (this._racksCache) return this._racksCache
+    const entries = []
+    for await (const data of this.racks.createReadStream()) {
+      entries.push(JSON.parse(data.value.toString()))
+    }
+    this._racksCache = entries
+    return entries
+  }
+
   async registerRack (req) {
     if (!req.id) {
       throw new Error('ERR_RACK_ID_INVALID')
@@ -86,6 +122,12 @@ class WrkProcAggr extends TetherWrkBase {
 
     if (!req.type) {
       throw new Error('ERR_RACK_TYPE_INVALID')
+    }
+
+    if (req.libInstance) {
+      const { id, type, libInstance } = req
+      this.ctx.libMap.set(id, { type, lib: libInstance })
+      return 1
     }
 
     const info = req.info
@@ -98,36 +140,35 @@ class WrkProcAggr extends TetherWrkBase {
       req.id,
       Buffer.from(JSON.stringify(req))
     )
+    if (this._racksCache) {
+      const idx = this._racksCache.findIndex(e => e.id === req.id)
+      if (idx !== -1) {
+        this._racksCache[idx] = req
+      } else {
+        this._racksCache.push(req)
+      }
+    }
 
     return 1
   }
 
   async forgetRacks (req) {
-    const stream = this.racks.createReadStream()
-    let cnt = 0
+    const entries = await this._getRacksEntries()
+    const toDelete = entries.filter(entry => {
+      if (req.all) return true
+      return Array.isArray(req.ids) && req.ids.includes(entry.id)
+    })
 
-    for await (const data of stream) {
-      const entry = JSON.parse(data.value.toString())
-
-      let valid = false
-
-      if (Array.isArray(req.ids)) {
-        if (req.ids.includes(entry.id)) {
-          valid = true
-        }
-      }
-
-      if (req.all) {
-        valid = true
-      }
-
-      if (valid) {
-        await this.racks.del(entry.id)
-        cnt++
-      }
+    for (const entry of toDelete) {
+      await this.racks.del(entry.id)
     }
 
-    return cnt
+    if (toDelete.length && this._racksCache) {
+      const deletedIds = new Set(toDelete.map(e => e.id))
+      this._racksCache = this._racksCache.filter(e => !deletedIds.has(e.id))
+    }
+
+    return toDelete.length
   }
 
   async listRacks (req) {
@@ -135,19 +176,12 @@ class WrkProcAggr extends TetherWrkBase {
       throw new Error('ERR_TYPE_INVALID')
     }
 
-    const stream = this.racks.createReadStream()
-    const res = []
-
-    for await (const data of stream) {
-      const entry = JSON.parse(data.value.toString())
-
-      if (!req.type || entry.type.startsWith(req.type)) {
-        res.push(entry)
-      }
-    }
+    const entries = await this._getRacksEntries()
+    const res = entries.filter(entry => !req.type || entry.type.startsWith(req.type))
 
     if (!req.keys) {
       return res.map(entry => {
+        // remove rpc key from info
         const sanitized = cloneDeep(entry)
         delete sanitized.info.rpcPublicKey
         return sanitized
@@ -158,21 +192,7 @@ class WrkProcAggr extends TetherWrkBase {
   }
 
   async listThings (req) {
-    const stream = this.racks.createReadStream()
-
-    const collection = await Array.prototype.concat.apply([], await async.mapLimit(stream, 25, async data => {
-      const entry = JSON.parse(data.value.toString())
-      try {
-        return await this.net_r0.jRequest(
-          entry.info.rpcPublicKey,
-          'listThings',
-          req, { timeout: 10000 }
-        )
-      } catch (e) {
-        this.debugError(`listThings ${entry.id}`, e, true)
-        return []
-      }
-    }))
+    const collection = await this.dataProxy.requestData('listThings', req, { timeout: 10000 })
 
     if (!req.sort) {
       return collection
@@ -183,25 +203,17 @@ class WrkProcAggr extends TetherWrkBase {
     return collection.sort((a, b) => sortThings(a, b, req.sort))
   }
 
+  async getThingsCount (req) {
+    const counts = await this.dataProxy.requestData('getThingsCount', req, { timeout: 10000 })
+    return counts.reduce((acc, c) => acc + (c || 0), 0)
+  }
+
   async getHistoricalLogs (req) {
     if (!req.logType) {
       throw new Error('ERR_LOG_TYPE_INVALID')
     }
-    const stream = this.racks.createReadStream()
 
-    const collection = await Array.prototype.concat.apply([], await async.mapLimit(stream, 25, async data => {
-      const entry = JSON.parse(data.value.toString())
-      try {
-        return await this.net_r0.jRequest(
-          entry.info.rpcPublicKey,
-          'getHistoricalLogs',
-          req, { timeout: 10000 }
-        )
-      } catch (e) {
-        this.debugError(`${req.logType} ${entry.id}`, e, true)
-        return []
-      }
-    }))
+    const collection = await this.dataProxy.requestData('getHistoricalLogs', req, { timeout: 10000 })
 
     if (!req.sort) {
       return collection
@@ -213,21 +225,30 @@ class WrkProcAggr extends TetherWrkBase {
   }
 
   async forgetThings (req) {
-    const stream = this.racks.createReadStream()
-
-    const collection = await Array.prototype.concat.apply([], await async.mapLimit(stream, 25, async data => {
-      const entry = JSON.parse(data.value.toString())
-
-      return this.net_r0.jRequest(
-        entry.info.rpcPublicKey,
-        'forgetThings',
-        req, { timeout: 10000 }
-      )
-    }))
+    const collection = await this.dataProxy.requestData('forgetThings', req, { timeout: 10000 })
 
     return collection.reduce((acc, e) => {
       return acc + e
     }, 0)
+  }
+
+  async storeFile (req) {
+    if (!req.rackId) throw new Error('ERR_RACK_ID_INVALID')
+    return this.dataProxy.requestRackData(req.rackId, 'storeFile', req, { timeout: 30000 })
+  }
+
+  async loadFile (req) {
+    if (!req.rackId) throw new Error('ERR_RACK_ID_INVALID')
+    return this.dataProxy.requestRackData(req.rackId, 'loadFile', req, { timeout: 30000 })
+  }
+
+  async removeFile (req) {
+    if (!req.rackId) throw new Error('ERR_RACK_ID_INVALID')
+    return this.dataProxy.requestRackData(req.rackId, 'removeFile', req, { timeout: 30000 })
+  }
+
+  async listFirmwares (req) {
+    return await this.dataProxy.requestData('listFirmwares', req, { timeout: 10000 })
   }
 
   async aggregateTailLogs () {
@@ -456,18 +477,6 @@ class WrkProcAggr extends TetherWrkBase {
     return { fields, aggrFields }
   }
 
-  async _racksForType (type) {
-    const stream = this.racks.createReadStream()
-    const racks = []
-    for await (const data of stream) {
-      const entry = JSON.parse(data.value.toString())
-      if (entry.type === type || entry.type.startsWith(`${type}-`)) {
-        racks.push(entry)
-      }
-    }
-    return racks
-  }
-
   _getTaillogSpecs (type) {
     // check optional config loaded
     if (!this.conf.aggrStats) {
@@ -494,23 +503,7 @@ class WrkProcAggr extends TetherWrkBase {
     // set fields to fetch from racks
     req.fields = fields
 
-    const racks = await this._racksForType(req.type)
-
-    let res = Array.prototype.concat.apply(
-      [],
-      await async.mapLimit(racks, 25, async rack => {
-        try {
-          return await this.net_r0.jRequest(
-            rack.info.rpcPublicKey,
-            'tailLog',
-            req, { timeout: 10000 }
-          )
-        } catch (e) {
-          this.debugError(`tailLog ${rack.id} type:${req.type} key:${req.key} tag:${req.tag}`, e, true)
-          return []
-        }
-      })
-    )
+    let res = await this.dataProxy.requestData('tailLog', req, { timeout: 10000, type: req.type })
 
     const aggrTimes = req.aggrTimes
     res = res.reduce((acc, item) => {
@@ -604,19 +597,11 @@ class WrkProcAggr extends TetherWrkBase {
     if (!req.rackId) throw new Error('ERR_RACK_ID_INVALID')
     if (!req.thingId) throw new Error('ERR_THING_ID_INVALID')
 
-    const rack = await this.racks.get(req.rackId)
-    if (!rack) return 0
-
-    const entry = JSON.parse(rack.value.toString())
     try {
-      return await this.net_r0.jRequest(
-        entry.info.rpcPublicKey,
-        methodName,
-        req,
-        { timeout: 10000 }
-      )
+      const res = await this.dataProxy.requestRackData(req.rackId, methodName, req, { timeout: 10000 })
+      return res ?? 0
     } catch (e) {
-      this.debugError(`${methodName} ${entry.id}`, e, true)
+      this.debugError(`${methodName} ${req.rackId}`, e, true)
       return 0
     }
   }
@@ -663,15 +648,16 @@ class WrkProcAggr extends TetherWrkBase {
   async _shouldSkipRackType (type, rack) {
     if (!type) return false
     const rackEntry = await this.racks.get(rack)
-    const raw = rackEntry?.value ?? rackEntry
-    const rackData = raw ? JSON.parse(raw.toString()) : null
-    return (rackData && rackData.type !== type && !rackData.type.startsWith(`${type}-`))
+    if (!rackEntry) return false
+    const raw = rackEntry.value != null ? rackEntry.value : rackEntry
+    const rackData = JSON.parse(raw.toString())
+    return rackData.type !== type && !rackData.type.startsWith(`${type}-`)
   }
 
   async pushAction (req) {
     const { query, action, params, voter, authPerms, batchActionUID, rackType = null } = req
 
-    const { targets, requiredPerms } = await this.actionCaller.getWriteCalls(query, action, params, authPerms)
+    const { targets, requiredPerms, approvalPerms } = await this.actionCaller.getWriteCalls(query, action, params, authPerms)
 
     let reqVotes = 1
     let callCount = 0
@@ -682,6 +668,8 @@ class WrkProcAggr extends TetherWrkBase {
       const entry = targets[rack]
       reqVotes = entry.reqVotes > reqVotes ? entry.reqVotes : reqVotes
       delete entry.reqVotes
+      // Clean up approvalPerms from targets (stored at payload level)
+      delete entry.approvalPerms
       callCount += entry.calls.length
 
       if (entry.error && INVALID_ACTIONS_ERRORS.some(err => entry.error.includes(err))) {
@@ -700,7 +688,7 @@ class WrkProcAggr extends TetherWrkBase {
 
     const data = await this.actionApprover_0.pushAction({
       action,
-      payload: [params, targets, requiredPerms],
+      payload: [params, targets, requiredPerms, approvalPerms],
       voter,
       reqVotesPos: reqVotes,
       // All the actions would denied by single negative vote.
@@ -722,71 +710,24 @@ class WrkProcAggr extends TetherWrkBase {
     if (!req.type) {
       throw new Error('ERR_TYPE_INVALID')
     }
-    const stream = this.racks.createReadStream()
-    const racks = []
-    const result = []
-    for await (const data of stream) {
-      const entry = JSON.parse(data.value.toString())
-      if (entry.type === req.type || entry.type.startsWith(`${req.type}-`)) {
-        racks.push(entry)
-      }
-    }
 
-    await async.eachLimit(racks, 25, async (rack) => {
-      try {
-        const config = await this.net_r0.jRequest(
-          rack.info.rpcPublicKey,
-          'getWrkConf',
-          req,
-          { timeout: 10000 }
-        )
-        result.push({ rackId: rack.id, config })
-      } catch (e) {
-        this.debugError(`getWrkConf ${rack.id}`, e, true)
-        result.push({ rackId: rack.id, config: null })
-      }
-    })
-
-    return result
+    return await this.dataProxy.requestData('getWrkConf', req, { timeout: 10000, type: req.type })
   }
 
   async getThingConf (req) {
     if (!req.type) {
       throw new Error('ERR_TYPE_INVALID')
     }
-    const stream = this.racks.createReadStream()
-    const racks = []
-    const result = []
-    for await (const data of stream) {
-      const entry = JSON.parse(data.value.toString())
-      if (entry.type === req.type || entry.type.startsWith(`${req.type}-`)) {
-        racks.push(entry)
-      }
-    }
 
-    await async.eachLimit(racks, 25, async (rack) => {
-      try {
-        const requestValue = await this.net_r0.jRequest(
-          rack.info.rpcPublicKey,
-          'getThingConf',
-          req,
-          { timeout: 10000 }
-        )
-        result.push({ rackId: rack.id, requestValue })
-      } catch (e) {
-        this.debugError(`getThingConf ${rack.id}`, e, true)
-        result.push({ rackId: rack.id, config: null })
-      }
-    })
-
-    return result
+    return await this.dataProxy.requestData('getThingConf', req, { timeout: 10000, type: req.type })
   }
 
   async getAction (req) {
     const { id, type } = req
     const { data } = await this.actionApprover_0.getAction(type, id)
-    // split targets, call params and required perms
+    // split targets, call params, required perms and approval perms
     data.requiredPerms = data.payload[2]
+    data.approvalPerms = data.payload[3] || data.payload[2]
     data.targets = data.payload[1]
     data.params = data.payload[0]
     delete data.payload
@@ -806,8 +747,9 @@ class WrkProcAggr extends TetherWrkBase {
         const entry = queryRes[i]
         if (entry.status === 'fulfilled') {
           const action = entry.value.data
-          // split targets, call params and required perms
+          // split targets, call params, required perms and approval perms
           action.requiredPerms = action.payload[2]
+          action.approvalPerms = action.payload[3] || action.payload[2]
           action.targets = action.payload[1]
           action.params = action.payload[0]
           delete action.payload
@@ -829,8 +771,10 @@ class WrkProcAggr extends TetherWrkBase {
   async voteAction (req) {
     const { id, voter, approve, authPerms } = req
     const { data } = await this.actionApprover_0.getAction('voting', id)
-    const requiredPerms = data.payload[2]
-    if (!requiredPerms.every(p => authPerms.includes(p))) {
+    // Use approvalPerms (payload[3]) if present, fallback to requiredPerms (payload[2])
+    // approvalPerms controls who can vote/approve, requiredPerms controls who can submit
+    const approvalPerms = data.payload[3] || data.payload[2]
+    if (!approvalPerms.every(p => authPerms.includes(p))) {
       throw new Error('ERR_ACTION_DENIED')
     }
 
@@ -863,8 +807,9 @@ class WrkProcAggr extends TetherWrkBase {
   async _getActionsFromQueryStream (queryStream) {
     const res = []
     for await (const entry of queryStream) {
-      // split targets, call params and required perms
+      // split targets, call params, required perms and approval perms
       entry.requiredPerms = entry.payload[2]
+      entry.approvalPerms = entry.payload[3] || entry.payload[2]
       entry.targets = entry.payload[1]
       entry.params = entry.payload[0]
       delete entry.payload
@@ -965,6 +910,32 @@ class WrkProcAggr extends TetherWrkBase {
     return await this._groupBatchActions(filteredActions, type)
   }
 
+  _sanitizeMingoQuery (obj) {
+    if (obj === null || obj === undefined || typeof obj !== 'object') return
+    if (Array.isArray(obj)) {
+      for (const item of obj) {
+        this._sanitizeMingoQuery(item)
+      }
+      return
+    }
+    for (const key of Object.keys(obj)) {
+      if (key.startsWith('$')) {
+        if (DISALLOWED_QUERY_OPERATORS.includes(key)) {
+          throw new Error('ERR_QUERY_OPERATOR_NOT_ALLOWED')
+        }
+        if (key === '$regex' && typeof obj[key] === 'string' && obj[key].length > MAX_REGEX_LENGTH) {
+          throw new Error('ERR_QUERY_REGEX_TOO_LONG')
+        }
+        if (!ALLOWED_QUERY_OPERATORS.has(key)) {
+          throw new Error('ERR_QUERY_OPERATOR_NOT_ALLOWED')
+        }
+      }
+      if (typeof obj[key] === 'object' && obj[key] !== null) {
+        this._sanitizeMingoQuery(obj[key])
+      }
+    }
+  }
+
   _filterData (data, req = {}) {
     if (!isNil(req.query) || !isNil(req.fields)) {
       const query = new mingo.Query(req.query || {})
@@ -980,6 +951,10 @@ class WrkProcAggr extends TetherWrkBase {
       throw new Error('ERR_QUERIES_INVALID')
     }
 
+    if (queries.length > MAX_QUERIES_COUNT) {
+      throw new Error('ERR_QUERIES_LIMIT_EXCEEDED')
+    }
+
     queries.forEach(query => {
       if (!query.type || typeof query.type !== 'string') {
         throw new Error('ERR_QUERIES_TYPE_INVALID')
@@ -990,7 +965,13 @@ class WrkProcAggr extends TetherWrkBase {
       const actions = await this._queryActionsByType(type, filter, opts, groupBatch)
 
       let finalQuery = query || {}
+      this._sanitizeMingoQuery(finalQuery)
+      if (fields) this._sanitizeMingoQuery(fields)
+
       if (suffix) {
+        if (suffix.length > MAX_SUFFIX_LENGTH) {
+          throw new Error('ERR_SUFFIX_TOO_LONG')
+        }
         const escapedSuffix = suffix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
         finalQuery = {
           ...finalQuery,
@@ -1008,31 +989,7 @@ class WrkProcAggr extends TetherWrkBase {
       throw new Error('ERR_TYPE_INVALID')
     }
 
-    const stream = this.racks.createReadStream()
-    const racks = []
-
-    for await (const data of stream) {
-      const entry = JSON.parse(data.value.toString())
-      if (entry.type === req.type || entry.type.startsWith(`${req.type}-`)) {
-        racks.push(entry)
-      }
-    }
-
-    let res = Array.prototype.concat.apply(
-      [],
-      await async.mapLimit(racks, 25, async rack => {
-        try {
-          return await this.net_r0.jRequest(
-            rack.info.rpcPublicKey,
-            'getWrkExtData',
-            req, { timeout: 10000 }
-          )
-        } catch (e) {
-          this.debugError(`getWrkExtData ${rack.id}`, e, true)
-          return []
-        }
-      })
-    )
+    let res = await this.dataProxy.requestData('getWrkExtData', req, { timeout: 10000, type: req.type })
 
     let specs = this.conf.aggrStats
     const btype = req.type.split('-')[0]
@@ -1067,6 +1024,11 @@ class WrkProcAggr extends TetherWrkBase {
     }
 
     return aggr
+  }
+
+  async setWrkExtData (req) {
+    if (!req.type) throw new Error('ERR_TYPE_INVALID')
+    return await this.dataProxy.requestData('setWrkExtData', req, { timeout: 10000, type: req.type })
   }
 
   async crossAggrActions () {
@@ -1118,7 +1080,7 @@ class WrkProcAggr extends TetherWrkBase {
         $and: crossThingDevices
       }
       const now = Date.now()
-      const lastActionAt = this.mem.crossActionsLRU[`${crossThingType}_${tag}`]
+      const lastActionAt = this.crossActionsLRU[`${crossThingType}_${tag}`]
       if ((now - lastActionAt) < (this.conf.crossAggrAction.minActionTsDiff || 60000)) {
         return
       }
@@ -1140,7 +1102,7 @@ class WrkProcAggr extends TetherWrkBase {
           voter: voter || 'MOS AUTOMATION',
           authPerms
         })
-        this.mem.crossActionsLRU[`${crossThingType}_${tag}`] = now
+        this.crossActionsLRU[`${crossThingType}_${tag}`] = now
       } catch (e) {
         this.debugError('ERR_CROSS_AGGR_ACTIONS_PUSH_ACTION', e, true)
       }
@@ -1150,16 +1112,9 @@ class WrkProcAggr extends TetherWrkBase {
   async getWrkSettings (req) {
     if (!req.rackId || (typeof req.rackId !== 'string')) throw new Error('ERR_RACK_ID_INVALID')
 
-    const rack = await this.racks.get(req.rackId)
-    if (!rack) return 0
-
-    const entry = JSON.parse(rack.value.toString())
     try {
-      return await this.net_r0.jRequest(
-        entry.info.rpcPublicKey,
-        'getWrkSettings',
-        req, { timeout: 10000 }
-      )
+      const res = await this.dataProxy.requestRackData(req.rackId, 'getWrkSettings', req, { timeout: 10000 })
+      return res ?? 0
     } catch (e) {
       this.debugError(`getWrkSettings ${req.rackId}`, e, true)
       throw new Error('ERR_GET_SETTINGS_FAILED')
@@ -1170,16 +1125,9 @@ class WrkProcAggr extends TetherWrkBase {
     if (!req.rackId || (typeof req.rackId !== 'string')) throw new Error('ERR_RACK_ID_INVALID')
     if (!req.entries || (typeof req.entries !== 'object')) throw new Error('ERR_ENTRIES_INVALID')
 
-    const rack = await this.racks.get(req.rackId)
-    if (!rack) return 0
-
-    const entry = JSON.parse(rack.value.toString())
     try {
-      return await this.net_r0.jRequest(
-        entry.info.rpcPublicKey,
-        'saveWrkSettings',
-        req, { timeout: 10000 }
-      )
+      const res = await this.dataProxy.requestRackData(req.rackId, 'saveWrkSettings', req, { timeout: 10000 })
+      return res ?? 0
     } catch (e) {
       this.debugError(`saveWrkSettings ${req.rackId}`, e, true)
       throw new Error('ERR_SAVE_SETTINGS_FAILED')
@@ -1196,6 +1144,196 @@ class WrkProcAggr extends TetherWrkBase {
     return null
   }
 
+  // ============ Generic Config CRUD Methods ============
+
+  _generateConfigId () {
+    return `${Date.now()}-${Math.random().toString(36).substring(2, 15)}`
+  }
+
+  _validateConfigType (type) {
+    const validTypes = Object.values(CONFIG_TYPES)
+    if (!type || !validTypes.includes(type)) {
+      throw new Error('ERR_CONFIG_TYPE_INVALID')
+    }
+  }
+
+  _getConfigDbKey (type, id) {
+    return `${type}:${id}`
+  }
+
+  _validatePoolConfigData (data) {
+    if (!data.poolConfigName || typeof data.poolConfigName !== 'string') {
+      throw new Error('ERR_POOL_CONFIG_NAME_INVALID')
+    }
+    if (data.description !== undefined && typeof data.description !== 'string') {
+      throw new Error('ERR_DESCRIPTION_INVALID')
+    }
+    if (!Array.isArray(data.poolUrls) || data.poolUrls.length === 0) {
+      throw new Error('ERR_POOL_URLS_INVALID')
+    }
+    for (const poolUrl of data.poolUrls) {
+      if (!poolUrl.url || typeof poolUrl.url !== 'string') {
+        throw new Error('ERR_POOL_URL_INVALID')
+      }
+      if (!poolUrl.workerName || typeof poolUrl.workerName !== 'string') {
+        throw new Error('ERR_WORKER_NAME_INVALID')
+      }
+      if (!poolUrl.workerPassword || typeof poolUrl.workerPassword !== 'string') {
+        throw new Error('ERR_WORKER_PASSWORD_INVALID')
+      }
+      if (!poolUrl.pool || typeof poolUrl.pool !== 'string') {
+        throw new Error('ERR_POOL_INVALID')
+      }
+    }
+  }
+
+  _validateConfigData (type, data) {
+    switch (type) {
+      case CONFIG_TYPES.POOL:
+        this._validatePoolConfigData(data)
+        break
+      default:
+        throw new Error('ERR_CONFIG_TYPE_INVALID')
+    }
+  }
+
+  async registerConfig (req) {
+    const { type, data } = req
+
+    this._validateConfigType(type)
+
+    if (!data) {
+      throw new Error('ERR_CONFIG_DATA_MISSING')
+    }
+
+    this._validateConfigData(type, data)
+
+    const now = Date.now()
+    const id = this._generateConfigId()
+    const config = {
+      id,
+      type,
+      ...data,
+      status: 'approved',
+      createdAt: now,
+      updatedAt: now
+    }
+
+    const dbKey = this._getConfigDbKey(type, id)
+    await this.configsDb.put(dbKey, Buffer.from(JSON.stringify(config)))
+
+    return config
+  }
+
+  async updateConfig (req) {
+    const { type, id, data } = req
+
+    this._validateConfigType(type)
+
+    if (!id) {
+      throw new Error('ERR_CONFIG_ID_MISSING')
+    }
+
+    const dbKey = this._getConfigDbKey(type, id)
+    const existingData = await this.configsDb.get(dbKey)
+    if (!existingData) {
+      throw new Error('ERR_CONFIG_NOT_FOUND')
+    }
+
+    const existingConfig = JSON.parse(existingData.value.toString())
+
+    // Merge new data into existing config
+    const updatedConfig = { ...existingConfig }
+
+    if (type === CONFIG_TYPES.POOL) {
+      if (data.poolConfigName !== undefined) {
+        if (typeof data.poolConfigName !== 'string' || !data.poolConfigName) {
+          throw new Error('ERR_POOL_CONFIG_NAME_INVALID')
+        }
+        updatedConfig.poolConfigName = data.poolConfigName
+      }
+      if (data.description !== undefined) {
+        if (typeof data.description !== 'string') {
+          throw new Error('ERR_DESCRIPTION_INVALID')
+        }
+        updatedConfig.description = data.description
+      }
+      if (data.poolUrls !== undefined) {
+        if (!Array.isArray(data.poolUrls) || data.poolUrls.length === 0) {
+          throw new Error('ERR_POOL_URLS_INVALID')
+        }
+        for (const poolUrl of data.poolUrls) {
+          if (!poolUrl.url || typeof poolUrl.url !== 'string') {
+            throw new Error('ERR_POOL_URL_INVALID')
+          }
+          if (!poolUrl.workerName || typeof poolUrl.workerName !== 'string') {
+            throw new Error('ERR_WORKER_NAME_INVALID')
+          }
+          if (!poolUrl.workerPassword || typeof poolUrl.workerPassword !== 'string') {
+            throw new Error('ERR_WORKER_PASSWORD_INVALID')
+          }
+          if (!poolUrl.pool || typeof poolUrl.pool !== 'string') {
+            throw new Error('ERR_POOL_INVALID')
+          }
+        }
+        updatedConfig.poolUrls = data.poolUrls
+      }
+    }
+
+    if (data.status !== undefined) {
+      if (!['pending', 'approved', 'rejected'].includes(data.status)) {
+        throw new Error('ERR_STATUS_INVALID')
+      }
+      updatedConfig.status = data.status
+    }
+
+    updatedConfig.updatedAt = Date.now()
+
+    await this.configsDb.put(dbKey, Buffer.from(JSON.stringify(updatedConfig)))
+
+    return updatedConfig
+  }
+
+  async getConfigs (req) {
+    const { type, query = {}, fields = {} } = req || {}
+
+    this._validateConfigType(type)
+
+    const prefix = `${type}:`
+    const stream = this.configsDb.createReadStream({
+      gte: prefix,
+      lt: `${type};` // Character after ':'
+    })
+
+    const configs = []
+    for await (const entry of stream) {
+      const config = JSON.parse(entry.value.toString())
+      configs.push(config)
+    }
+
+    return this._filterData(configs, { query, fields })
+  }
+
+  async deleteConfig (req) {
+    const { type, id } = req
+
+    this._validateConfigType(type)
+
+    if (!id) {
+      throw new Error('ERR_CONFIG_ID_MISSING')
+    }
+
+    const dbKey = this._getConfigDbKey(type, id)
+    const existingData = await this.configsDb.get(dbKey)
+    if (!existingData) {
+      throw new Error('ERR_CONFIG_NOT_FOUND')
+    }
+
+    await this.configsDb.del(dbKey)
+
+    return 1
+  }
+
   _start (cb) {
     async.series([
       next => { super._start(next) },
@@ -1209,6 +1347,7 @@ class WrkProcAggr extends TetherWrkBase {
         )
 
         await this.racks.ready()
+        await this._getRacksEntries()
 
         this.actionDb = await this.store_s1.getBee(
           { name: 'action-approver' }
@@ -1221,7 +1360,20 @@ class WrkProcAggr extends TetherWrkBase {
         )
         await this.tailLogAggrDb.ready()
 
-        const actionCaller = new ActionCaller(this.net_r0, this.racks, this.conf.ork.callTargetsLimit)
+        // store generic configs in db (pool configs, etc.)
+        this.configsDb = await this.store_s1.getBee(
+          { name: 'configs' },
+          { keyEncoding: 'utf-8' }
+        )
+        await this.configsDb.ready()
+
+        const orkActionsConfig = this.conf.ork.orkActions || {}
+        // Merge default action config resolvers with any custom ones from config
+        const actionConfigResolvers = {
+          ...DEFAULT_ACTION_CONFIG_RESOLVERS,
+          ...(this.conf.ork.actionConfigResolvers || {})
+        }
+        const actionCaller = new ActionCaller(this.net_r0, this.racks, this.conf.ork.callTargetsLimit, this, orkActionsConfig, this.configsDb, actionConfigResolvers)
         const actionCallerProxy = new Proxy(actionCaller, {
           get: (target, property, receiver) => {
             // proxy action calls as methods don't exist

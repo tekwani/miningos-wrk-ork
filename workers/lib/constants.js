@@ -27,7 +27,11 @@ const ACTION_TYPES = {
   UPDATE_THING: 'updateThing',
   FORGET_THINGS: 'forgetThings',
 
-  RACK_REBOOT: 'rackReboot'
+  RACK_REBOOT: 'rackReboot',
+
+  REGISTER_CONFIG: 'registerConfig',
+  UPDATE_CONFIG: 'updateConfig',
+  DELETE_CONFIG: 'deleteConfig'
 }
 
 const MS_24_HOURS = 24 * 60 * 60 * 1000
@@ -58,6 +62,7 @@ const RPC_METHODS = [
   { name: 'forgetRacks', op: 'w' },
   { name: 'listRacks', op: 'r' },
   { name: 'listThings', op: 'r' },
+  { name: 'getThingsCount', op: 'r' },
   { name: 'getHistoricalLogs', op: 'r' },
   { name: 'forgetThings', op: 'w' },
   { name: 'tailLog', op: 'r' },
@@ -75,11 +80,17 @@ const RPC_METHODS = [
   { name: 'getActionsBatch', op: 'r' },
   { name: 'cancelActionsBatch', op: 'w' },
   { name: 'getWrkExtData', op: 'r' },
+  { name: 'setWrkExtData', op: 'w' },
   { name: 'tailLogCustomRangeAggr', op: 'r' },
   { name: 'getWrkConf', op: 'r' },
   { name: 'getThingConf', op: 'r' },
   { name: 'getWrkSettings', op: 'r' },
-  { name: 'saveWrkSettings', op: 'w' }
+  { name: 'saveWrkSettings', op: 'w' },
+  { name: 'getConfigs', op: 'r' },
+  { name: 'storeFile', op: 'w' },
+  { name: 'loadFile', op: 'r' },
+  { name: 'removeFile', op: 'w' },
+  { name: 'listFirmwares', op: 'r' }
 ]
 
 const INVALID_ACTIONS_ERRORS = [
@@ -88,6 +99,31 @@ const INVALID_ACTIONS_ERRORS = [
 ]
 
 const DEFAULT_TIMEZONE = 'UTC'
+
+const DISALLOWED_QUERY_OPERATORS = ['$where', '$expr']
+
+const CONFIG_TYPES = {
+  POOL: 'pool'
+}
+
+/**
+ * Default action config resolvers - maps actions to their config resolution rules
+ * The full config object is passed to the device worker which handles transformation
+ *
+ * Structure:
+ * {
+ *   [actionName]: {
+ *     configIdParam: string,  // Param field containing the config ID
+ *     configType: string      // Config type prefix in DB (e.g., 'pool' -> 'pool:configId')
+ *   }
+ * }
+ */
+const DEFAULT_ACTION_CONFIG_RESOLVERS = {
+  setupPools: {
+    configIdParam: 'poolConfigId',
+    configType: 'pool'
+  }
+}
 
 module.exports = {
   ACTION_TYPES,
@@ -98,5 +134,8 @@ module.exports = {
   COMMENT_ACTION,
   RPC_METHODS,
   INVALID_ACTIONS_ERRORS,
-  DEFAULT_TIMEZONE
+  DEFAULT_TIMEZONE,
+  DISALLOWED_QUERY_OPERATORS,
+  CONFIG_TYPES,
+  DEFAULT_ACTION_CONFIG_RESOLVERS
 }
