@@ -215,7 +215,7 @@ class MockActionApprover {
     if (!action) {
       throw new Error('ERR_ACTION_NOT_FOUND')
     }
-    return { data: action }
+    return { data: structuredClone(action) }
   }
 
   async voteAction (opts) {
@@ -244,7 +244,7 @@ class MockActionApprover {
     const results = []
     for (const [key, action] of this.actions.entries()) {
       if (this.isActionValid(key, type, filter, action)) {
-        results.push(action)
+        results.push(structuredClone(action))
       }
     }
     return results
@@ -818,6 +818,58 @@ test('getHistoricalLogs', async (t) => {
       t.is(err.message, 'ERR_LOG_TYPE_INVALID', 'should throw correct error')
     }
   })
+
+  t.test('should only query racks of req.type when provided', async (t) => {
+    const worker = await createWorker()
+    worker._start(() => {})
+
+    await worker.registerRack({ id: 'rack-1', type: 'wrk-miner-s19', info: { rpcPublicKey: 'key1' } })
+    await worker.registerRack({ id: 'rack-2', type: 'dcs-siemens', info: { rpcPublicKey: 'key2' } })
+
+    worker.net_r0.jRequestCalls = []
+    await worker.getHistoricalLogs({ logType: 'consumption', type: 'dcs-siemens' })
+    t.alike(worker.net_r0.jRequestCalls.map(c => c.publicKey), ['key2'])
+
+    worker.net_r0.jRequestCalls = []
+    await worker.getHistoricalLogs({ logType: 'alerts' })
+    t.alike(worker.net_r0.jRequestCalls.map(c => c.publicKey).sort(), ['key1', 'key2'], 'no type still fans out to all racks')
+  })
+})
+
+test('saveHistoricalLog', async (t) => {
+  t.test('should forward only to racks of req.type', async (t) => {
+    const worker = await createWorker()
+    worker._start(() => {})
+
+    await worker.registerRack({ id: 'rack-1', type: 'wrk-miner-s19', info: { rpcPublicKey: 'key1' } })
+    await worker.registerRack({ id: 'rack-2', type: 'dcs-siemens', info: { rpcPublicKey: 'key2' } })
+
+    worker.net_r0.jRequestCalls = []
+    worker.net_r0.jRequest = async function (publicKey, method, params, opts) {
+      this.jRequestCalls.push({ publicKey, method, params, opts })
+      return { upserted: params.entries.length }
+    }
+
+    const req = { logType: 'consumption', type: 'dcs-siemens', timezone: 'UTC', entries: [{ ts: 0 }] }
+    const result = await worker.saveHistoricalLog(req)
+    t.alike(result, [{ upserted: 1 }])
+    t.is(worker.net_r0.jRequestCalls.length, 1)
+    t.is(worker.net_r0.jRequestCalls[0].publicKey, 'key2')
+    t.is(worker.net_r0.jRequestCalls[0].method, 'saveHistoricalLog')
+    t.alike(worker.net_r0.jRequestCalls[0].params, req)
+  })
+
+  t.test('should require logType and type', async (t) => {
+    const worker = await createWorker()
+    worker._start(() => {})
+
+    await t.exception(() => worker.saveHistoricalLog({ type: 'dcs-siemens' }), /ERR_LOG_TYPE_INVALID/)
+    await t.exception(() => worker.saveHistoricalLog({ logType: 'consumption' }), /ERR_TYPE_INVALID/)
+  })
+
+  t.test('should be registered as a write rpc', async (t) => {
+    t.alike(RPC_METHODS.find(m => m.name === 'saveHistoricalLog'), { name: 'saveHistoricalLog', op: 'w' })
+  })
 })
 
 test('forgetThings', async (t) => {
@@ -1037,6 +1089,32 @@ test('getAction', async (t) => {
     t.ok(result.targets, 'should have targets')
     t.ok(result.requiredPerms, 'should have requiredPerms')
   })
+
+  t.test('should redact stored credentials on every read path', async (t) => {
+    const worker = await createWorker()
+    worker._start(() => {})
+
+    const poolUrls = () => [{ url: 'stratum+tcp://pool:3333', workerName: 'w1', workerPassword: 'pool-secret' }]
+    const action = await worker.actionApprover_0.pushAction({
+      action: 'registerThing',
+      payload: [
+        [{ opts: { address: '10.0.0.1', username: 'root', password: 'miner-secret' } }, { data: { poolUrls: poolUrls() } }],
+        { ork: { calls: [{ id: 'ork', result: { poolUrls: poolUrls() } }] } },
+        ['miner']
+      ],
+      voter: 'test@example.com',
+      reqVotesPos: 2,
+      reqVotesNeg: 1
+    })
+
+    const single = await worker.getAction({ id: action.id, type: 'voting' })
+    const [batch] = await worker.getActionsBatch({ ids: [action.id] })
+    const [streamed] = await worker._getActionsFromQueryStream([(await worker.actionApprover_0.getAction('voting', action.id)).data])
+    for (const res of [single, batch.action, streamed]) {
+      t.is(JSON.stringify(res).match(/secret|username/g), null, 'should not expose credentials')
+      t.is(res.params[0].opts.address, '10.0.0.1', 'should keep non-secret opts')
+    }
+  })
 })
 
 test('voteAction', async (t) => {
@@ -1046,7 +1124,7 @@ test('voteAction', async (t) => {
 
     const action = await worker.actionApprover_0.pushAction({
       action: 'reboot',
-      payload: [['param1'], { 'rack-1': { calls: [] } }, ['miner:rw']],
+      payload: [['param1'], { 'rack-1': { calls: [] } }, ['miner']],
       voter: 'test@example.com',
       reqVotesPos: 1,
       reqVotesNeg: 1
@@ -1068,7 +1146,7 @@ test('voteAction', async (t) => {
 
     const action = await worker.actionApprover_0.pushAction({
       action: 'reboot',
-      payload: [['param1'], { 'rack-1': { calls: [] } }, ['miner:rw']],
+      payload: [['param1'], { 'rack-1': { calls: [] } }, ['miner']],
       voter: 'test@example.com',
       reqVotesPos: 1,
       reqVotesNeg: 1

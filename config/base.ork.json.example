@@ -6,19 +6,19 @@
     "orkActions": {
         "registerConfig": {
             "enabled": true,
-            "reqVotes": 2,
+            "reqVotes": 1,
             "requiredPerms": ["pool_config"],
             "approvalPerms": ["pool_config_approve"]
         },
         "updateConfig": {
             "enabled": true,
-            "reqVotes": 2,
+            "reqVotes": 1,
             "requiredPerms": ["pool_config"],
             "approvalPerms": ["pool_config_approve"]
         },
         "deleteConfig": {
             "enabled": true,
-            "reqVotes": 2,
+            "reqVotes": 1,
             "requiredPerms": ["pool_config"],
             "approvalPerms": ["pool_config_approve"]
         }

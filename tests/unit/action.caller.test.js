@@ -2,7 +2,7 @@
 
 const test = require('brittle')
 const ActionCaller = require('../../workers/lib/action.caller')
-const { ACTION_TYPES, READ_ONLY_ACTIONS } = require('../../workers/lib/constants')
+const { ACTION_TYPES, READ_ONLY_ACTIONS, ACTION_CALL_TIMEOUTS_MS } = require('../../workers/lib/constants')
 
 // Mock NetFacility - we'll bypass instanceof checks in tests
 class MockNetFacility {
@@ -453,6 +453,52 @@ test('ActionCaller callTargets', async (t) => {
     t.is(net.jRequestCalls.length, 0, 'should make no calls')
   })
 
+  t.test('should apply the long-call timeout for downloadLogs', async (t) => {
+    const net = new MockNetFacility()
+    const racks = new MockHyperbee({
+      rack1: { id: 'rack1', info: { rpcPublicKey: 'key1' } }
+    })
+    const caller = createActionCaller(net, racks)
+
+    const targets = { rack1: { calls: [{ id: 'thing1', tags: [] }] } }
+
+    await caller.callTargets('downloadLogs', [{ query: { id: 'thing1' } }], targets)
+
+    t.is(
+      net.jRequestCalls[0].opts.timeout,
+      ACTION_CALL_TIMEOUTS_MS.downloadLogs,
+      'should extend the RPC timeout beyond the 30s default'
+    )
+  })
+
+  t.test('should not override an explicit timeout for downloadLogs', async (t) => {
+    const net = new MockNetFacility()
+    const racks = new MockHyperbee({
+      rack1: { id: 'rack1', info: { rpcPublicKey: 'key1' } }
+    })
+    const caller = createActionCaller(net, racks)
+
+    const targets = { rack1: { calls: [{ id: 'thing1', tags: [] }] } }
+
+    await caller.callTargets('downloadLogs', [{ query: { id: 'thing1' } }], targets, { timeout: 5000 })
+
+    t.is(net.jRequestCalls[0].opts.timeout, 5000, 'caller-provided timeout should win')
+  })
+
+  t.test('should keep the default timeout for other actions', async (t) => {
+    const net = new MockNetFacility()
+    const racks = new MockHyperbee({
+      rack1: { id: 'rack1', info: { rpcPublicKey: 'key1' } }
+    })
+    const caller = createActionCaller(net, racks)
+
+    const targets = { rack1: { calls: [{ id: 'thing1', tags: [] }] } }
+
+    await caller.callTargets('setLED', [true], targets)
+
+    t.is(net.jRequestCalls[0].opts.timeout, undefined, 'should not set a timeout for short actions')
+  })
+
   t.test('should invoke ork instance method for ORK-level action', async (t) => {
     const net = new MockNetFacility()
     const racks = new MockHyperbee()
@@ -576,6 +622,22 @@ test('ActionCaller _resolveActionConfig', async (t) => {
     const result = await caller._resolveActionConfig('setupPools', { otherParam: 'value' })
 
     t.is(result, null, 'should return null when config ID param is missing')
+  })
+
+  t.test('should throw error if raw config supplied without config ID param', async (t) => {
+    const net = new MockNetFacility()
+    const racks = new MockHyperbee()
+    const configsDb = new MockHyperbee({})
+    const caller = createActionCaller(net, racks, 50, null, {}, configsDb, testActionConfigResolvers)
+
+    try {
+      await caller._resolveActionConfig('setupPools', {
+        config: { id: 'attacker-config', poolUrls: [{ url: 'stratum://evil.example.com:3333', workerName: 'w', workerPassword: 'p' }] }
+      })
+      t.fail('should throw error')
+    } catch (err) {
+      t.is(err.message, 'ERR_RAW_CONFIG_NOT_ALLOWED', 'should reject raw config used to bypass the approval ceremony')
+    }
   })
 
   t.test('should throw error if configsDb is not available', async (t) => {
