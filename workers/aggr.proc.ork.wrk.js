@@ -6,6 +6,7 @@ const debug = require('debug')('ork:aggr')
 const gLibStats = require('@tetherto/miningos-lib-stats')
 const mingo = require('mingo')
 const ActionCaller = require('./lib/action.caller')
+const { hasWritePermission } = require('./lib/permissions')
 const { cloneDeep, isNil, isEmpty } = require('@bitfinex/lib-js-util-base')
 const { differenceInDays, addDays } = require('date-fns')
 const { daysTo24HrIntervals, isCurrentDay, sortThings } = require('./lib/util')
@@ -218,7 +219,8 @@ class WrkProcAggr extends TetherWrkBase {
       throw new Error('ERR_LOG_TYPE_INVALID')
     }
 
-    const collection = await this.dataProxy.requestData('getHistoricalLogs', req, { timeout: 10000 })
+    // type narrows the fan-out to racks of that type (e.g. dcs for logs only it owns)
+    const collection = await this.dataProxy.requestData('getHistoricalLogs', req, { timeout: 10000, type: req.type })
 
     if (!req.sort) {
       return collection
@@ -227,6 +229,14 @@ class WrkProcAggr extends TetherWrkBase {
     const query = new mingo.Query({})
     const cursor = query.find(collection).sort(req.sort)
     return cursor.all()
+  }
+
+  async saveHistoricalLog (req) {
+    if (!req.logType) throw new Error('ERR_LOG_TYPE_INVALID')
+    // writable historical logs are owned by a specific rack type; never broadcast
+    if (!req.type) throw new Error('ERR_TYPE_INVALID')
+
+    return await this.dataProxy.requestData('saveHistoricalLog', req, { timeout: 10000, type: req.type })
   }
 
   async forgetThings (req) {
@@ -826,6 +836,22 @@ class WrkProcAggr extends TetherWrkBase {
     return 1
   }
 
+  _redactAction (action) {
+    const items = Array.isArray(action.params) ? [...action.params] : []
+    for (const target of Object.values(action.targets || {})) {
+      target?.calls?.forEach(call => items.push(call?.result))
+    }
+    for (const item of items) {
+      if (item?.opts) {
+        delete item.opts.username
+        delete item.opts.password
+      }
+      for (const poolUrls of [item?.poolUrls, item?.data?.poolUrls]) {
+        poolUrls?.forEach?.(u => { if (u) delete u.workerPassword })
+      }
+    }
+  }
+
   async getAction (req) {
     const { id, type } = req
     const { data } = await this.actionApprover_0.getAction(type, id)
@@ -835,6 +861,7 @@ class WrkProcAggr extends TetherWrkBase {
     data.targets = data.payload[1]
     data.params = data.payload[0]
     delete data.payload
+    this._redactAction(data)
 
     return data
   }
@@ -857,6 +884,7 @@ class WrkProcAggr extends TetherWrkBase {
           action.targets = action.payload[1]
           action.params = action.payload[0]
           delete action.payload
+          this._redactAction(action)
           return { type, action }
         }
       }
@@ -878,7 +906,7 @@ class WrkProcAggr extends TetherWrkBase {
     // Use approvalPerms (payload[3]) if present, fallback to requiredPerms (payload[2])
     // approvalPerms controls who can vote/approve, requiredPerms controls who can submit
     const approvalPerms = data.payload[3] || data.payload[2]
-    if (!approvalPerms.every(p => authPerms.includes(p))) {
+    if (!approvalPerms.every(p => hasWritePermission(authPerms, p))) {
       throw new Error('ERR_ACTION_DENIED')
     }
 
@@ -917,6 +945,7 @@ class WrkProcAggr extends TetherWrkBase {
       entry.targets = entry.payload[1]
       entry.params = entry.payload[0]
       delete entry.payload
+      this._redactAction(entry)
       for (const target of Object.values(entry.targets)) {
         target.calls?.forEach(call => {
           delete call.tags
@@ -1282,7 +1311,7 @@ class WrkProcAggr extends TetherWrkBase {
       if (!poolUrl.workerName || typeof poolUrl.workerName !== 'string') {
         throw new Error('ERR_WORKER_NAME_INVALID')
       }
-      if (!poolUrl.workerPassword || typeof poolUrl.workerPassword !== 'string') {
+      if (typeof poolUrl.workerPassword !== 'string') {
         throw new Error('ERR_WORKER_PASSWORD_INVALID')
       }
       if (!poolUrl.pool || typeof poolUrl.pool !== 'string') {
@@ -1373,7 +1402,7 @@ class WrkProcAggr extends TetherWrkBase {
           if (!poolUrl.workerName || typeof poolUrl.workerName !== 'string') {
             throw new Error('ERR_WORKER_NAME_INVALID')
           }
-          if (!poolUrl.workerPassword || typeof poolUrl.workerPassword !== 'string') {
+          if (typeof poolUrl.workerPassword !== 'string') {
             throw new Error('ERR_WORKER_PASSWORD_INVALID')
           }
           if (!poolUrl.pool || typeof poolUrl.pool !== 'string') {

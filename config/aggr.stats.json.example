@@ -97,6 +97,10 @@
         "op": "obj_concat",
         "src": "temperature_c_group_max"
       },
+      "temperature_c_group_aggr": {
+        "op": "obj_concat",
+        "src": "temperature_c_group"
+      },
       "alerts_aggr": {
         "op": "alerts_aggr",
         "src": "alerts_cnt"
@@ -432,6 +436,10 @@
       "workersCount":{
         "op": "sum",
         "src": "count"
+      },
+      "hashrateHistory":{
+        "op": "arr_concat",
+        "src": "hashrateHistory"
       }
     }
   },
