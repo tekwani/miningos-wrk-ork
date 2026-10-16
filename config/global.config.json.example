@@ -10,6 +10,10 @@
   "nominalSiteMinerCapacity": 4232,
   "nominalSiteWeightedAvgEfficiency": 28.36,
   "nominalAvailablePowerMWh": 22.5,
+  "capexUsd": 18000000,
+  "phaseCapexUsd": {
+    "phase1_5": 400000
+  },
   "phaseNominals": {
     "phase1_5": {
       "nominalHashrate_MHS": 50760000000,
